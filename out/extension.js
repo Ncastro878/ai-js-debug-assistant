@@ -1,16 +1,15 @@
 "use strict";
 /**
- * VS Code Claude Debug Extension
+ * VS Code Claude Debug Extension with Express Server
  *
- * This extension bridges VS Code's JavaScript/TypeScript debugger with AI agents like Claude Code.
- * It automatically captures debugging context (variables, stack traces, scopes) when you hit
- * breakpoints and can transmit this data to external AI tools for analysis.
+ * This extension creates an HTTP API that Claude Code can use to programmatically control
+ * VS Code's debugger and analyze debugging data in real-time.
  *
- * Key Features:
- * - Captures complete debug context at breakpoints
- * - Extracts stack traces, variable scopes, and values
- * - Outputs structured JSON data perfect for AI consumption
- * - Ready for integration with Claude Code and other AI debugging assistants
+ * Features:
+ * - HTTP API for debug control (step, continue, pause, etc.)
+ * - Breakpoint management via REST endpoints
+ * - Real-time debug context capture and analysis
+ * - Automatic port discovery and status reporting
  */
 var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
     if (k2 === undefined) k2 = k;
@@ -45,177 +44,398 @@ var __importStar = (this && this.__importStar) || (function () {
         return result;
     };
 })();
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.activate = activate;
 exports.deactivate = deactivate;
-// Import the VS Code extensibility API
-// This gives us access to all VS Code functionality like debugging, UI, commands, etc.
 const vscode = __importStar(require("vscode"));
-/**
- * Extension Activation Function
- *
- * This function is called by VS Code when the extension is activated.
- * Activation happens based on the "activationEvents" defined in package.json.
- *
- * Current activation events:
- * - "onCommand:claudeDebug.dumpContext" - when our command is run
- * - "onDebug" - when any debugging session starts
- * - "*" - immediately when VS Code starts
- *
- * @param context - Extension context provided by VS Code, contains subscriptions and other extension lifecycle info
- */
+const express_1 = __importDefault(require("express"));
+const cors_1 = __importDefault(require("cors"));
+const fs = __importStar(require("fs"));
+const path = __importStar(require("path"));
+// Global variables for server management
+let server;
+let serverInstance;
+let currentPort;
+let outputChannel;
 function activate(context) {
-    // Log activation for debugging purposes
-    // Using both console.log and console.error to ensure visibility in different log outputs
-    console.log('Claude Debugger Extension Activated!');
-    console.error('Claude Debugger Extension Activated! (using error log for visibility)');
-    // Create a dedicated output channel for our extension's logs
-    // This appears in VS Code's Output panel and provides a clean view of our debug data
-    const outputChannel = vscode.window.createOutputChannel('Claude Debug');
-    // Set up debug session event listeners
-    // These allow us to monitor debugging activity and potentially auto-capture context
-    // Fires when a debug session starts (user presses F5, starts debugging, etc.)
-    vscode.debug.onDidStartDebugSession(session => {
-        console.log(`Debug session started: ${session.name}`);
-        // TODO: Could auto-capture initial context here or set up breakpoint listeners
-    });
-    // Fires when a debug session stops (user stops debugging, app finishes, etc.)
-    vscode.debug.onDidTerminateDebugSession(session => {
-        console.log(`Debug session ended: ${session.name}`);
-        // TODO: Could clean up any stored debug data or send final summary to AI
-    });
-    // Fires on custom debug events (breakpoints hit, exceptions thrown, stepping, etc.)
-    // This is where we could automatically capture context when breakpoints are hit
-    vscode.debug.onDidReceiveDebugSessionCustomEvent(event => {
-        console.log(`Custom debug event: ${event.event}`);
-        // TODO: Auto-capture context on 'stopped' events (breakpoints, exceptions)
-        // if (event.event === 'stopped') {
-        //     captureDebugContext();
-        // }
-    });
-    /**
-     * Register the main command: "Claude Debug: Dump Context"
-     *
-     * This command appears in VS Code's Command Palette (Cmd+Shift+P) and can be run
-     * manually when you're at a breakpoint to capture complete debug context.
-     *
-     * The command ID 'claudeDebug.dumpContext' must match what's defined in package.json
-     * under contributes.commands[].command
-     */
-    let disposable = vscode.commands.registerCommand('claudeDebug.dumpContext', async () => {
-        // Get the currently active debug session
-        // This will be null if no debugging is happening
-        const session = vscode.debug.activeDebugSession;
-        if (!session) {
-            vscode.window.showWarningMessage("No active debug session");
-            return;
-        }
+    console.log('🚀 Claude Debug Extension with Express Server Activated!');
+    // Create output channel for logging
+    outputChannel = vscode.window.createOutputChannel('Claude Debug API');
+    // Start the Express server
+    startExpressServer(context);
+    // Set up debug event listeners
+    setupDebugListeners();
+    // Register manual commands (backup for HTTP API)
+    registerManualCommands(context);
+}
+/**
+ * Start Express Server for Claude Code API
+ */
+async function startExpressServer(context) {
+    server = (0, express_1.default)();
+    server.use((0, cors_1.default)());
+    server.use(express_1.default.json());
+    // Try ports 3001-3010 until we find one available
+    const PORTS = [3001, 3002, 3003, 3004, 3005, 3006, 3007, 3008, 3009, 3010];
+    for (const port of PORTS) {
         try {
-            // STEP 1: Get Stack Trace
-            // This uses VS Code's Debug Adapter Protocol (DAP) to request the current call stack
-            // threadId: 1 is typically the main thread for single-threaded languages like JavaScript
-            const stackResp = await session.customRequest('stackTrace', {
-                threadId: 1 // Usually 1 for single-threaded languages like JavaScript/TypeScript
+            serverInstance = await new Promise((resolve, reject) => {
+                const srv = server.listen(port, () => resolve(srv));
+                srv.on('error', reject);
             });
-            // Log the stack trace to multiple outputs for maximum visibility
-            console.log("=== FULL STACK TRACE ===");
-            console.log(JSON.stringify(stackResp, null, 2));
-            console.error("=== FULL STACK TRACE ==="); // Error logs are more visible
-            console.error(JSON.stringify(stackResp, null, 2));
-            // Also log to our dedicated output channel (cleanest view)
-            outputChannel.appendLine("=== FULL STACK TRACE ===");
-            outputChannel.appendLine(JSON.stringify(stackResp, null, 2));
-            outputChannel.show(); // Automatically show the output channel
-            // Show a quick status popup to the user
-            vscode.window.showInformationMessage(`Stack frames: ${stackResp.stackFrames.length}`);
-            // STEP 2: Get Variable Scopes for the Top Stack Frame
-            // Scopes contain different categories of variables (local, global, closure, etc.)
-            // We use the top frame (where execution is currently paused)
-            const scopesResp = await session.customRequest('scopes', {
-                frameId: stackResp.stackFrames[0].id
-            });
-            console.log("=== FULL SCOPES ===");
-            console.log(JSON.stringify(scopesResp, null, 2));
-            console.error("=== FULL SCOPES ===");
-            console.error(JSON.stringify(scopesResp, null, 2));
-            outputChannel.appendLine("=== FULL SCOPES ===");
-            outputChannel.appendLine(JSON.stringify(scopesResp, null, 2));
-            vscode.window.showInformationMessage(`Scopes: ${scopesResp.scopes.length}`);
-            // STEP 3: Get Actual Variable Values from the First Scope
-            // The first scope is usually "Local" variables - the most relevant for debugging
-            // variablesReference is a unique ID that lets us fetch the actual variable data
-            const varsResp = await session.customRequest('variables', {
-                variablesReference: scopesResp.scopes[0].variablesReference
-            });
-            console.log("=== FULL VARIABLES ===");
-            console.log(JSON.stringify(varsResp, null, 2));
-            console.error("=== FULL VARIABLES ===");
-            console.error(JSON.stringify(varsResp, null, 2));
-            outputChannel.appendLine("=== FULL VARIABLES ===");
-            outputChannel.appendLine(JSON.stringify(varsResp, null, 2));
-            vscode.window.showInformationMessage(`Variables: ${varsResp.variables.length}`);
-            // STEP 4: Extract and Log Key Information About Current Execution Context
-            console.log("=== TOP FRAME DETAILS ===");
-            console.error("=== TOP FRAME DETAILS ===");
-            const topFrame = stackResp.stackFrames[0];
-            console.log(`File: ${topFrame.source?.path}`);
-            console.log(`Function: ${topFrame.name}`);
-            console.log(`Line: ${topFrame.line}, Column: ${topFrame.column}`);
-            console.error(`File: ${topFrame.source?.path}`);
-            console.error(`Function: ${topFrame.name}`);
-            console.error(`Line: ${topFrame.line}, Column: ${topFrame.column}`);
-            outputChannel.appendLine("=== TOP FRAME DETAILS ===");
-            outputChannel.appendLine(`File: ${topFrame.source?.path}`);
-            outputChannel.appendLine(`Function: ${topFrame.name}`);
-            outputChannel.appendLine(`Line: ${topFrame.line}, Column: ${topFrame.column}`);
-            // 🚀 FUTURE: AI Integration Point
-            // At this point you have complete debug context in structured JSON format:
-            // - stackResp: Full call stack with file paths, line numbers, function names
-            // - scopesResp: Available variable scopes (local, global, closure, etc.)
-            // - varsResp: Actual variable names, values, and types
-            // - topFrame: Current execution location details
-            // 
-            // This data can be sent to Claude Code via:
-            // - HTTP POST request to a local server
-            // - WebSocket message
-            // - File system communication
-            // - VS Code extension messaging API
-            //
-            // Example future integration:
-            // await sendToClaudeCode({
-            //     stack: stackResp,
-            //     scopes: scopesResp, 
-            //     variables: varsResp,
-            //     currentFrame: topFrame,
-            //     timestamp: new Date().toISOString()
-            // });
+            currentPort = port;
+            // Log success
+            const message = `🔥 Claude Debug API running on http://localhost:${port}`;
+            console.log(message);
+            outputChannel.appendLine(message);
+            outputChannel.show();
+            // Show status in VS Code
+            const statusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left);
+            statusItem.text = `$(debug-alt) Claude Debug API :${port}`;
+            statusItem.tooltip = `Claude Debug API running on port ${port}`;
+            statusItem.show();
+            context.subscriptions.push(statusItem);
+            // Write port info for Claude Code discovery
+            writePortInfo(port);
+            // Set up all the API routes
+            setupAPIRoutes();
+            break;
         }
         catch (error) {
-            // Handle any errors in the debug protocol communication
-            console.error('Error capturing debug context:', error);
-            vscode.window.showErrorMessage(`Failed to capture debug context: ${error}`);
+            continue; // Try next port
+        }
+    }
+    if (!serverInstance) {
+        vscode.window.showErrorMessage('Failed to start Claude Debug API server on any port');
+    }
+}
+/**
+ * Write port info to file for Claude Code discovery
+ */
+function writePortInfo(port) {
+    const portInfo = {
+        port,
+        pid: process.pid,
+        timestamp: new Date().toISOString(),
+        status: 'running'
+    };
+    try {
+        // Write to temp directory for cross-platform compatibility
+        const tmpDir = require('os').tmpdir();
+        const portFile = path.join(tmpDir, 'vscode-claude-debug-port.json');
+        fs.writeFileSync(portFile, JSON.stringify(portInfo, null, 2));
+        console.log(`Port info written to: ${portFile}`);
+    }
+    catch (error) {
+        console.error('Failed to write port info:', error);
+    }
+}
+/**
+ * Set up all API routes for Claude Code
+ */
+function setupAPIRoutes() {
+    // Health check endpoint
+    server.get('/health', (req, res) => {
+        res.json({
+            status: 'ok',
+            port: currentPort,
+            hasActiveSession: !!vscode.debug.activeDebugSession,
+            timestamp: new Date().toISOString()
+        });
+    });
+    // Get current debug status
+    server.get('/debug/status', async (req, res) => {
+        try {
+            const session = vscode.debug.activeDebugSession;
+            res.json({
+                hasActiveSession: !!session,
+                sessionName: session?.name || null,
+                sessionType: session?.type || null,
+                breakpoints: vscode.debug.breakpoints.length,
+                timestamp: new Date().toISOString()
+            });
+        }
+        catch (error) {
+            res.status(500).json({ error: error instanceof Error ? error.message : 'Unknown error' });
         }
     });
-    // Add the command to the extension's subscriptions
-    // This ensures VS Code properly cleans up the command when the extension is deactivated
-    // All event listeners and commands should be added to context.subscriptions
-    context.subscriptions.push(disposable);
+    // Capture current debug context (your existing functionality)
+    server.get('/debug/context', async (req, res) => {
+        try {
+            const context = await captureDebugContext();
+            res.json(context);
+        }
+        catch (error) {
+            res.status(500).json({ error: error instanceof Error ? error.message : 'Unknown error' });
+        }
+    });
+    // Debug step commands
+    server.post('/debug/step', async (req, res) => {
+        try {
+            const { action = 'over' } = req.body;
+            let command;
+            switch (action) {
+                case 'over':
+                    command = 'workbench.action.debug.stepOver';
+                    break;
+                case 'into':
+                    command = 'workbench.action.debug.stepInto';
+                    break;
+                case 'out':
+                    command = 'workbench.action.debug.stepOut';
+                    break;
+                default:
+                    return res.status(400).json({ error: 'Invalid step action. Use: over, into, out' });
+            }
+            await vscode.commands.executeCommand(command);
+            // Wait a moment for step to complete, then capture context
+            setTimeout(async () => {
+                try {
+                    const context = await captureDebugContext();
+                    outputChannel.appendLine(`✅ Step ${action} completed`);
+                }
+                catch (err) {
+                    console.error('Failed to capture context after step:', err);
+                }
+            }, 500);
+            res.json({
+                success: true,
+                action: `step_${action}`,
+                message: `Executed step ${action}`
+            });
+        }
+        catch (error) {
+            res.status(500).json({ error: error instanceof Error ? error.message : 'Unknown error' });
+        }
+    });
+    // Debug control commands
+    server.post('/debug/control', async (req, res) => {
+        try {
+            const { action } = req.body;
+            let command;
+            let message;
+            switch (action) {
+                case 'continue':
+                    command = 'workbench.action.debug.continue';
+                    message = 'Continued execution';
+                    break;
+                case 'pause':
+                    command = 'workbench.action.debug.pause';
+                    message = 'Paused execution';
+                    break;
+                case 'stop':
+                    command = 'workbench.action.debug.stop';
+                    message = 'Stopped debugging';
+                    break;
+                case 'restart':
+                    command = 'workbench.action.debug.restart';
+                    message = 'Restarted debugging';
+                    break;
+                case 'start':
+                    command = 'workbench.action.debug.start';
+                    message = 'Started debugging';
+                    break;
+                default:
+                    return res.status(400).json({ error: 'Invalid action. Use: continue, pause, stop, restart, start' });
+            }
+            await vscode.commands.executeCommand(command);
+            outputChannel.appendLine(`✅ ${message}`);
+            res.json({
+                success: true,
+                action,
+                message
+            });
+        }
+        catch (error) {
+            res.status(500).json({ error: error instanceof Error ? error.message : 'Unknown error' });
+        }
+    });
+    // Set breakpoints
+    server.post('/debug/breakpoint', async (req, res) => {
+        try {
+            const { file, line, action = 'set' } = req.body;
+            if (!file || !line) {
+                return res.status(400).json({ error: 'file and line are required' });
+            }
+            const uri = vscode.Uri.file(file);
+            const position = new vscode.Position(line - 1, 0); // VS Code uses 0-based line numbers
+            const location = new vscode.Location(uri, position);
+            const breakpoint = new vscode.SourceBreakpoint(location);
+            if (action === 'set') {
+                vscode.debug.addBreakpoints([breakpoint]);
+                outputChannel.appendLine(`✅ Breakpoint set at ${file}:${line}`);
+                res.json({
+                    success: true,
+                    action: 'set',
+                    file,
+                    line,
+                    message: `Breakpoint set at ${file}:${line}`
+                });
+            }
+            else if (action === 'remove') {
+                vscode.debug.removeBreakpoints([breakpoint]);
+                outputChannel.appendLine(`✅ Breakpoint removed from ${file}:${line}`);
+                res.json({
+                    success: true,
+                    action: 'remove',
+                    file,
+                    line,
+                    message: `Breakpoint removed from ${file}:${line}`
+                });
+            }
+            else {
+                res.status(400).json({ error: 'Invalid action. Use: set, remove' });
+            }
+        }
+        catch (error) {
+            res.status(500).json({ error: error instanceof Error ? error.message : 'Unknown error' });
+        }
+    });
+    // List all breakpoints
+    server.get('/debug/breakpoints', (req, res) => {
+        try {
+            const breakpoints = vscode.debug.breakpoints.map(bp => {
+                if (bp instanceof vscode.SourceBreakpoint) {
+                    return {
+                        type: 'source',
+                        file: bp.location.uri.fsPath,
+                        line: bp.location.range.start.line + 1, // Convert back to 1-based
+                        enabled: bp.enabled
+                    };
+                }
+                return { type: 'other', enabled: bp.enabled };
+            });
+            res.json({ breakpoints, count: breakpoints.length });
+        }
+        catch (error) {
+            res.status(500).json({ error: error instanceof Error ? error.message : 'Unknown error' });
+        }
+    });
+    // Evaluate expression in debug context
+    server.post('/debug/evaluate', async (req, res) => {
+        try {
+            const { expression, context: evalContext = 'watch' } = req.body;
+            if (!expression) {
+                return res.status(400).json({ error: 'expression is required' });
+            }
+            const session = vscode.debug.activeDebugSession;
+            if (!session) {
+                return res.status(400).json({ error: 'No active debug session' });
+            }
+            const result = await session.customRequest('evaluate', {
+                expression,
+                context: evalContext
+            });
+            outputChannel.appendLine(`✅ Evaluated: ${expression} = ${result.result}`);
+            res.json({
+                success: true,
+                expression,
+                result: result.result,
+                type: result.type
+            });
+        }
+        catch (error) {
+            res.status(500).json({ error: error instanceof Error ? error.message : 'Unknown error' });
+        }
+    });
+    outputChannel.appendLine('🔥 All API routes configured!');
+}
+/**
+ * Capture complete debug context (extracted from your existing code)
+ */
+async function captureDebugContext() {
+    const session = vscode.debug.activeDebugSession;
+    if (!session) {
+        throw new Error('No active debug session');
+    }
+    // Get stack trace
+    const stackResp = await session.customRequest('stackTrace', {
+        threadId: 1
+    });
+    // Get scopes for top frame
+    const scopesResp = await session.customRequest('scopes', {
+        frameId: stackResp.stackFrames[0].id
+    });
+    // Get variables for first scope
+    const varsResp = await session.customRequest('variables', {
+        variablesReference: scopesResp.scopes[0].variablesReference
+    });
+    const topFrame = stackResp.stackFrames[0];
+    const context = {
+        timestamp: new Date().toISOString(),
+        session: {
+            name: session.name,
+            type: session.type
+        },
+        currentFrame: {
+            file: topFrame.source?.path,
+            function: topFrame.name,
+            line: topFrame.line,
+            column: topFrame.column
+        },
+        stack: stackResp,
+        scopes: scopesResp,
+        variables: varsResp
+    };
+    // Log to output channel
+    outputChannel.appendLine('📊 Debug context captured');
+    outputChannel.appendLine(`📁 File: ${context.currentFrame.file}`);
+    outputChannel.appendLine(`🔢 Line: ${context.currentFrame.line}`);
+    outputChannel.appendLine(`📚 Variables: ${context.variables.variables.length}`);
+    return context;
+}
+/**
+ * Set up debug event listeners
+ */
+function setupDebugListeners() {
+    vscode.debug.onDidStartDebugSession(session => {
+        outputChannel.appendLine(`🚀 Debug session started: ${session.name}`);
+    });
+    vscode.debug.onDidTerminateDebugSession(session => {
+        outputChannel.appendLine(`🛑 Debug session ended: ${session.name}`);
+    });
+    vscode.debug.onDidReceiveDebugSessionCustomEvent(event => {
+        if (event.event === 'stopped') {
+            outputChannel.appendLine(`⏸️  Debugger stopped: ${event.body?.reason || 'unknown'}`);
+        }
+    });
+}
+/**
+ * Register manual commands (backup for HTTP API)
+ */
+function registerManualCommands(context) {
+    const dumpCommand = vscode.commands.registerCommand('claudeDebug.dumpContext', async () => {
+        try {
+            const context = await captureDebugContext();
+            vscode.window.showInformationMessage('Debug context captured! Check output channel.');
+        }
+        catch (error) {
+            vscode.window.showErrorMessage(`Failed to capture context: ${error instanceof Error ? error.message : 'Unknown error'}`);
+        }
+    });
+    context.subscriptions.push(dumpCommand);
 }
 /**
  * Extension Deactivation Function
- *
- * Called when the extension is deactivated (VS Code closes, extension disabled, etc.)
- * Use this for cleanup tasks like:
- * - Closing network connections
- * - Saving state
- * - Disposing of resources
- *
- * Currently we don't need any cleanup, but this is where it would go.
  */
 function deactivate() {
-    // No cleanup needed yet, but future versions might:
-    // - Close HTTP servers
-    // - Clear cached debug data
-    // - Notify AI services that debugging session ended
+    if (serverInstance) {
+        serverInstance.close();
+        console.log('🛑 Claude Debug API server stopped');
+    }
+    // Clean up port info file
+    try {
+        const tmpDir = require('os').tmpdir();
+        const portFile = path.join(tmpDir, 'vscode-claude-debug-port.json');
+        if (fs.existsSync(portFile)) {
+            fs.unlinkSync(portFile);
+        }
+    }
+    catch (error) {
+        console.error('Failed to clean up port file:', error);
+    }
 }
 //# sourceMappingURL=extension.js.map
